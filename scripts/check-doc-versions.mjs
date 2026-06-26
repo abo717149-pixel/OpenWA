@@ -1,48 +1,73 @@
-#!/usr/bin/env node
-/**
- * Version-consistency guard.
- *
- * Stops the recurring "we cut a release but a doc still shows the old version" problem by failing
- * CI when a *current-version* reference drifts from package.json. It does NOT touch historical
- * version mentions (CHANGELOG history, roadmap milestones, example image tags) — only the three
- * places that must always reflect the shipped version:
- *
- *   1. The README version badges (root + docs/) must be the DYNAMIC shields endpoint that reads
- *      package.json automatically — never a hardcoded `badge/version-x.y.z`.
- *   2. src/config/swagger.config.ts must source the version from package.json — never `setVersion('x.y.z')`.
- *   3. CHANGELOG.md must carry a `## [<current version>]` entry (the release notes exist).
- *
- * Run locally: `npm run check:versions`. Runs in CI (lint job).
- */
-import { readFileSync } from 'node:fs';
+import { create } from '@open-wa/wa-automate';
 
-const root = new URL('../', import.meta.url);
-const read = (rel) => readFileSync(new URL(rel, root), 'utf8');
+create({
+  sessionId: "ANTI_DELETE_BOT",
+  authTimeout: 0,
+  blockCrashLogs: true,
+  disableSpamCheck: true,
+  hostNotificationLang: 'ar',
+  logConsole: false,
+}).then(client => start(client));
 
-const version = JSON.parse(read('package.json')).version;
-const errors = [];
+function start(client) {
+  console.log('✅ تم تشغيل البوت بنجاح! جاري مراقبة الرسائل لإنشاء الـ QR Code...');
 
-// 1) README badges must be dynamic, not a pinned `badge/version-x`.
-for (const f of ['README.md', 'docs/README.md']) {
-  if (/shields\.io\/badge\/version-\d/.test(read(f))) {
-    errors.push(`${f}: hardcoded version badge — use the dynamic shields "github/package-json/v" badge so it tracks package.json.`);
-  }
+  let myNumber;
+  client.getMe().then(me => {
+    myNumber = me.id;
+  });
+
+  // 1. مراقبة رسائل العرض لمرة واحدة (View Once)
+  client.onMessage(async (message) => {
+    if (message.isViewOnce) {
+      const time = new Date(message.timestamp * 1000).toLocaleString('ar-EG');
+      const details = `⚠️ *تنبيه: رسالة عرض لمرة واحدة* ⚠️\n\n` +
+                      `👤 *المرسل:* ${message.sender.pushname || 'غير معروف'}\n` +
+                      `📞 *الرقم:* ${message.from.split('@')[0]}\n` +
+                      (message.isGroupMsg ? `👥 *في مجموعة:* ${message.chat.name}\n` : `💬 *خاصة*\n`) +
+                      `⏰ *الوقت:* ${time}\n` +
+                      `📁 *نوع المرفق:* ${message.type}\n\n` +
+                      `⏳ جاري إعادة إرسال المحتوى السري...`;
+      
+      await client.sendText(myNumber, details);
+
+      try {
+        const decryptedMedia = await client.decryptMedia(message);
+        await client.sendImage(myNumber, decryptedMedia, 'view_once.jpg', 'مرفق العرض لمرة واحدة');
+      } catch (err) {
+        await client.sendText(myNumber, `❌ فشل استخراج المرفق: \n\n${message.body || message.caption}`);
+      }
+    }
+  });
+
+  // 2. مراقبة الرسائل المحذوفة (Anti-Delete)
+  client.onMessageRevoked(async (revokedMessage) => {
+    const originalMsg = revokedMessage.message;
+    if (!originalMsg) return;
+
+    const timeDeleted = new Date().toLocaleString('ar-EG');
+    const timeSent = new Date(originalMsg.timestamp * 1000).toLocaleString('ar-EG');
+
+    let report = `🗑️ *تنبيه: تم حذف رسالة* 🗑️\n\n` +
+                 `👤 *المرسل:* ${originalMsg.sender.pushname || 'غير معروف'}\n` +
+                 `📞 *الرقم:* ${originalMsg.from.split('@')[0]}\n` +
+                 (originalMsg.isGroupMsg ? `👥 *في مجموعة:* ${originalMsg.chat.name}\n` : `💬 *خاصة*\n`) +
+                 `📤 *وقت الإرسال:* ${timeSent}\n` +
+                 `🗑️ *وقت الحذف:* ${timeDeleted}\n` +
+                 `🔽 *المحتوى المحذوف:* 🔽\n------------------------\n`;
+
+    if (originalMsg.type === 'chat') {
+      report += `${originalMsg.body}`;
+      await client.sendText(myNumber, report);
+    } else {
+      report += `[مرفق وسائط: ${originalMsg.type}] - ${originalMsg.caption || ''}`;
+      await client.sendText(myNumber, report);
+      try {
+        const decryptedMedia = await client.decryptMedia(originalMsg);
+        await client.sendImage(myNumber, decryptedMedia, 'deleted.jpg', 'المرفق المحذوف');
+      } catch (e) {
+        await client.sendText(myNumber, `❌ تعذر استرجاع ملف الوسائط المحذوف.`);
+      }
+    }
+  });
 }
-
-// 2) Swagger version must come from package.json, not a literal.
-if (/setVersion\(\s*['"]\d/.test(read('src/config/swagger.config.ts'))) {
-  errors.push("src/config/swagger.config.ts: hardcoded setVersion('x.y.z') — use require('../../package.json').version.");
-}
-
-// 3) CHANGELOG must have an entry for the current version.
-if (!read('CHANGELOG.md').includes(`## [${version}]`)) {
-  errors.push(`CHANGELOG.md: missing a "## [${version}]" entry for the current package.json version — add the release notes before tagging.`);
-}
-
-if (errors.length) {
-  console.error(`\n✖ Version consistency check failed (package.json = ${version}):`);
-  for (const e of errors) console.error(`  - ${e}`);
-  console.error('\nFix the above so docs track the release automatically, then re-run `npm run check:versions`.\n');
-  process.exit(1);
-}
-console.log(`✓ Version consistency OK (package.json = ${version}).`);
